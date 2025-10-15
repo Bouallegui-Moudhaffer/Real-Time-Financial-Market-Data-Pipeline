@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/trade.schema.json",
+  "title": "InboundTrade",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "type",
+    "source",
+    "ingest_ts",
+    "event_ts",
+    "symbol",
+    "price",
+    "volume",
+    "key"
+  ],
+  "properties": {
+    "type": { "const": "trade" },
+    "source": { "type": "string", "enum": ["finnhub", "replay"] },
+    "ingest_ts": { "type": "string", "format": "date-time" },
+    "event_ts": { "type": "integer", "minimum": 0, "description": "ms since epoch" },
+    "symbol": {
+      "type": "string",
+      "pattern": "^[A-Z\\.\\-]{1,20}$"
+    },
+    "price": { "type": "number", "minimum": 0 },
+    "volume": { "type": "number", "minimum": 0 },
+    "conditions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "key": { "type": "string", "minLength": 3 }
+  }
+}

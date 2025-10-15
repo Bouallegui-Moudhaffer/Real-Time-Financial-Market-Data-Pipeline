@@ -1,0 +1,3 @@
+-- Reserved for future seed data or role creation.
+-- Intentionally empty for Step 4 (idempotent application).
+-- If you want to inject a quick smoke row manually, see sample_queries.cql.

@@ -1,0 +1,7 @@
+fastapi==0.115.4
+uvicorn[standard]==0.30.6
+cachetools==5.5.0
+prometheus-client==0.21.0
+cassandra-driver==3.29.2
+pydantic==2.9.2
+pydantic-settings==2.4.0

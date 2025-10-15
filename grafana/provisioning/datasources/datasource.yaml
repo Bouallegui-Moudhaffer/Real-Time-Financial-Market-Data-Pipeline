@@ -1,0 +1,11 @@
+apiVersion: 1
+datasources:
+  - name: RTMKT JSON
+    type: yesoreyeram-infinity-datasource
+    access: proxy
+    isDefault: true
+    jsonData:
+      global_queries: []
+      allow_template_variables: true
+      tlsSkipVerify: true
+    secureJsonData: {}

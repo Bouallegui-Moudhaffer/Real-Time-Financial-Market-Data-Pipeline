@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/ohlcv.schema.json",
+  "title": "OHLCVWindow",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "symbol",
+    "bucket_date",
+    "window_start",
+    "window_end",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "trade_count",
+    "vwap",
+    "last_event_ts",
+    "src"
+  ],
+  "properties": {
+    "symbol": { "type": "string" },
+    "bucket_date": { "type": "string", "format": "date" },
+    "window_start": { "type": "string", "format": "date-time" },
+    "window_end": { "type": "string", "format": "date-time" },
+    "open": { "type": "number" },
+    "high": { "type": "number" },
+    "low": { "type": "number" },
+    "close": { "type": "number" },
+    "volume": { "type": "number" },
+    "trade_count": { "type": "integer" },
+    "vwap": { "type": "number" },
+    "pct_change_1m": { "type": "number" },
+    "last_event_ts": { "type": "string", "format": "date-time" },
+    "src": { "type": "string" }
+  }
+}

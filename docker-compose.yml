@@ -1,0 +1,251 @@
+x-env: &default-env
+  TZ: Europe/Paris
+
+networks:
+  rtmkt-net:
+
+volumes:
+  kafka_data:
+  cassandra_data:
+  grafana_data:
+  spark_checkpoints:
+  spark_ivy_cache:
+
+services:
+  # ----------------------------
+  # Kafka (KRaft, single node)
+  # ----------------------------
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: rtmkt-kafka
+    environment:
+      <<: *default-env
+      KAFKA_ENABLE_KRAFT: "yes"
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_PROCESS_ROLES: "broker,controller"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CFG_LOG_DIRS: "/bitnami/kafka/data"
+      # Use defaults for cluster ID; it will be generated and persisted in volume
+      KAFKA_CFG_NUM_PARTITIONS: "6"
+      KAFKA_CFG_DELETE_TOPIC_ENABLE: "true"
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/bitnami/kafka
+      - ./kafka:/kafka-scripts:ro
+    healthcheck:
+      # list topics to ensure the broker API is up
+      test: ["CMD-SHELL", "/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - rtmkt-net
+
+  kafka-setup:
+    image: bitnami/kafka:3.7
+    container_name: rtmkt-kafka-setup
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: *default-env
+      KAFKA_BROKERS: "kafka:9092"
+    volumes:
+      - ./kafka:/kafka-scripts:ro
+    command:
+      - /bin/bash
+      - -lc
+      - |
+          set -euxo pipefail
+          echo "== listing /kafka-scripts =="
+          ls -la /kafka-scripts
+          echo "== running script =="
+          /bin/bash /kafka-scripts/create-topics.sh
+    networks:
+      - rtmkt-net
+    restart: "no"
+
+
+
+  # ----------------------------
+  # Cassandra
+  # ----------------------------
+  cassandra:
+    image: cassandra:4.1.5
+    container_name: rtmkt-cassandra
+    environment:
+      <<: *default-env
+      CASSANDRA_CLUSTER_NAME: "rtmkt"
+      CASSANDRA_NUM_TOKENS: "16"
+      MAX_HEAP_SIZE: "1G"
+      HEAP_NEWSIZE: "256M"
+    ports:
+      - "9042:9042"
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+      - ./cassandra:/cql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'SELECT now() FROM system.local' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+    networks:
+      - rtmkt-net
+
+  cassandra-init:
+    image: cassandra:4.1.5
+    container_name: rtmkt-cassandra-init
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    command: |
+      "
+      echo 'Applying schema.cql and init.cql...'
+      cqlsh cassandra -f /cql/schema.cql
+      if [ -s /cql/init.cql ]; then cqlsh cassandra -f /cql/init.cql; fi
+      echo 'Cassandra schema initialized.'
+      "
+    volumes:
+      - ./cassandra:/cql:ro
+    networks:
+      - rtmkt-net
+    restart: "no"
+
+  # ----------------------------
+  # Spark (Master + Worker for later jobs)
+  # ----------------------------
+  spark-master:
+    image: apache/spark:3.5.6
+    container_name: rtmkt-spark-master
+    hostname: spark-master
+    command: ["/bin/bash","-lc","/opt/spark/sbin/start-master.sh -h spark-master && tail -f /dev/null"]
+    ports:
+      - "8081:8080"   # Master Web UI -> http://localhost:8081
+      - "7077:7077"   # Master RPC
+    networks:
+      - rtmkt-net
+    healthcheck:
+      test: ["CMD-SHELL", "ps -ef | grep -q '[o]rg.apache.spark.deploy.master.Master'"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  spark-worker:
+    image: apache/spark:3.5.6
+    container_name: rtmkt-spark-worker
+    depends_on:
+      spark-master:
+        condition: service_started
+    command: ["/bin/bash","-lc","/opt/spark/sbin/start-worker.sh spark://spark-master:7077 --cores 2 --memory 2G && tail -f /dev/null"]
+    ports:
+      - "8082:8081"   # Worker Web UI -> http://localhost:8082
+    networks:
+      - rtmkt-net
+    healthcheck:
+      test: ["CMD-SHELL", "ps -ef | grep -q '[o]rg.apache.spark.deploy.worker.Worker'"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    volumes:
+      - spark_checkpoints:/opt/checkpoints
+
+  # ----------------------------
+  # REST API (FastAPI)
+  # ----------------------------
+  rest:
+    build:
+      context: .
+      dockerfile: services/rest/Dockerfile
+    container_name: rtmkt-rest
+    depends_on:
+      cassandra-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *default-env
+      PORT: "${REST_PORT:-8080}"
+      SYMBOLS: "${SYMBOLS:-AAPL,MSFT,SPY}"
+      CASSANDRA_HOST: "cassandra"
+      CASSANDRA_PORT: "9042"
+      CASSANDRA_KEYSPACE: "market_ks"
+    networks:
+      - rtmkt-net
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # ----------------------------
+  # Grafana
+  # ----------------------------
+  grafana:
+    image: grafana/grafana:11.2.1
+    container_name: rtmkt-grafana
+    environment:
+      <<: *default-env
+      GF_INSTALL_PLUGINS: yesoreyeram-infinity-datasource
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    depends_on:
+      rest:
+        condition: service_healthy
+      api:
+        condition: service_started
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - rtmkt-net
+
+  # ----------------------------
+  # Producer (not started in Step 2)
+  # ----------------------------
+  producer:
+    build:
+      context: ./services/producer
+      dockerfile: Dockerfile
+    container_name: rtmkt-producer
+    environment:
+      <<: *default-env
+      FINNHUB_API_TOKEN: "${FINNHUB_API_TOKEN:-}"
+      SYMBOLS: "${SYMBOLS:-AAPL,MSFT,SPY}"
+      KAFKA_BROKERS: "kafka:9092"
+      PRODUCER_MODE: "live"
+    networks:
+      - rtmkt-net
+    # We will enable/command this in Step 5
+    restart: "no"
+
+  api:
+    build:
+      context: ./services/api
+    image: rtmkt-api:latest
+    container_name: rtmkt-api
+    environment:
+      CASSANDRA_CONTACT_POINTS: cassandra
+      CASSANDRA_PORT: 9042
+      CASSANDRA_KEYSPACE: market_ks
+    depends_on:
+      cassandra-init:
+        condition: service_completed_successfully
+    networks:
+      - rtmkt-net
+    ports:
+      - "8000:8000"
+

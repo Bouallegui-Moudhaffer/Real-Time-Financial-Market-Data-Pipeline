@@ -1,0 +1,43 @@
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+# Keep Black's built-in excludes and add your own
+extend-exclude = '''
+/(
+  \.venv
+  | venv
+  | \.tox
+  | build
+  | dist
+  | \.mypy_cache
+  | \.ruff_cache
+  | node_modules
+  | __pypackages__
+  | checkpoints
+)/
+'''
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-select = ["B", "I", "UP", "SIM", "F", "E", "W", "C90"]
+ignore = ["E203", "E501"]  # handled by black
+
+# IMPORTANT: use extend-exclude so Ruff's defaults remain (which already include .venv)
+extend-exclude = [
+  ".venv", "venv", ".tox", "build", "dist",
+  ".mypy_cache", ".ruff_cache", "node_modules",
+  "__pypackages__", "checkpoints"
+]
+# (Ruff defaults also respect .gitignore by default.)
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+strict_optional = false
+
+[tool.pytest.ini_options]
+testpaths = ["services", "tests"]
+addopts = "-q"
