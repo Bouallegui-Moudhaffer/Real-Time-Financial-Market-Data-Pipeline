@@ -161,35 +161,6 @@ services:
       - spark_checkpoints:/opt/checkpoints
 
   # ----------------------------
-  # REST API (FastAPI)
-  # ----------------------------
-  rest:
-    build:
-      context: .
-      dockerfile: services/rest/Dockerfile
-    container_name: rtmkt-rest
-    depends_on:
-      cassandra-init:
-        condition: service_completed_successfully
-    environment:
-      <<: *default-env
-      PORT: "${REST_PORT:-8080}"
-      SYMBOLS: "${SYMBOLS:-AAPL,MSFT,SPY}"
-      CASSANDRA_HOST: "cassandra"
-      CASSANDRA_PORT: "9042"
-      CASSANDRA_KEYSPACE: "market_ks"
-    networks:
-      - rtmkt-net
-    ports:
-      - "8080:8080"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health >/dev/null || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
-
-  # ----------------------------
   # Grafana
   # ----------------------------
   grafana:
@@ -201,8 +172,6 @@ services:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
     depends_on:
-      rest:
-        condition: service_healthy
       api:
         condition: service_started
     ports:
@@ -232,6 +201,10 @@ services:
     # We will enable/command this in Step 5
     restart: "no"
 
+  # ----------------------------
+  # REST API (FastAPI)
+  # ----------------------------
+
   api:
     build:
       context: ./services/api
@@ -248,4 +221,9 @@ services:
       - rtmkt-net
     ports:
       - "8000:8000"
-
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/healthz >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s

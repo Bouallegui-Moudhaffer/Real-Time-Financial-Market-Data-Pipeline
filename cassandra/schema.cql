@@ -117,3 +117,18 @@ COMMENT ON TABLE trades_raw IS 'Optional raw trades with 24h TTL; not required f
 COMMENT ON TABLE ohlcv_1s  IS 'Per-second OHLCV; TTL 7d; keyed by (symbol, date).';
 COMMENT ON TABLE ohlcv_1m  IS 'Per-minute OHLCV; TTL 30d; used by REST/Grafana.';
 COMMENT ON TABLE indicators_1m IS 'Per-minute indicators (VWAP, volatility).';
+
+
+-- recent signal events (partition by symbol + bucket date for easy querying)
+CREATE TABLE IF NOT EXISTS market_ks.signals_recent (
+  symbol      text,
+  bucket_date date,
+  ts          timestamp,
+  type        text,
+  pct_change  double,
+  close       double,
+  vwap        double,
+  volume      double,
+  src         text,
+  PRIMARY KEY ((symbol, bucket_date), ts)
+) WITH CLUSTERING ORDER BY (ts DESC);

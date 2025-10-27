@@ -225,6 +225,49 @@ def write_signals_kafka(df_1m: DataFrame, checkpoint_root: str, trigger: str):
     )
 
 
+def write_signals_cassandra(df_1m: DataFrame, keyspace: str, checkpoint_root: str, trigger: str):
+    enable = get_env("ENABLE_SIGNALS", "1").lower() in ("1", "true", "yes", "on")
+    if not enable:
+        return None
+
+    threshold = float(get_env("SIGNAL_PCT_CHANGE", "0.01"))
+    ck = os.path.join(checkpoint_root, "signals_recent")
+
+    sig_rows = (
+        df_1m
+        .filter(F.abs(F.col("pct_change_1m")) >= F.lit(threshold))
+        .select(
+            F.col("symbol"),
+            F.to_date(F.col("window_start")).alias("bucket_date"),
+            F.col("window_start").alias("ts"),
+            F.lit("pct_change").alias("type"),
+            F.col("pct_change_1m").alias("pct_change"),
+            F.col("close"),
+            F.col("vwap"),
+            F.col("volume"),
+            F.col("src"),
+        )
+    )
+
+    def _writer(batch_df: DataFrame, batch_id: int):
+        (
+            batch_df.write.format("org.apache.spark.sql.cassandra")
+            .options(keyspace=keyspace, table="signals_recent")
+            .mode("append")
+            .save()
+        )
+
+    return (
+        sig_rows.writeStream.outputMode("append")
+        .foreachBatch(_writer)
+        .option("checkpointLocation", ck)
+        .queryName("signals_recent_cassandra_writer")
+        .trigger(processingTime=trigger)
+        .start()
+    )
+
+
+
 def main():
     spark = build_spark()
 
@@ -272,11 +315,18 @@ def main():
     # NEW: Kafka signals (optional; defaults ON)
     q4 = write_signals_kafka(df_1m, checkpoint_root=checkpoint_root, trigger=trigger)
 
+    q5 = write_signals_cassandra(
+    df_1m, keyspace=keyspace, checkpoint_root=checkpoint_root, trigger=trigger)
+
     spark.sparkContext.setLogLevel(get_env("SPARK_LOG_LEVEL", "WARN"))
 
     # Await all active queries
-    if q4 is not None:
+    if q4 is not None and q5 is not None:
+        q1.awaitTermination(); q2.awaitTermination(); q3.awaitTermination(); q4.awaitTermination(); q5.awaitTermination()
+    elif q4 is not None:
         q1.awaitTermination(); q2.awaitTermination(); q3.awaitTermination(); q4.awaitTermination()
+    elif q5 is not None:
+        q1.awaitTermination(); q2.awaitTermination(); q3.awaitTermination(); q5.awaitTermination()
     else:
         q1.awaitTermination(); q2.awaitTermination(); q3.awaitTermination()
 

@@ -12,8 +12,7 @@ from pydantic import BaseModel
 from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra.policies import RoundRobinPolicy
 from cassandra.query import PreparedStatement, dict_factory
-from cassandra import ConsistencyLevel
-from cassandra import OperationTimedOut
+from cassandra import ConsistencyLevel, OperationTimedOut
 
 # ---- Config
 RAW_CONTACTS = os.getenv("CASSANDRA_CONTACT_POINTS", "cassandra")
@@ -22,7 +21,7 @@ KEYSPACE = os.getenv("CASSANDRA_KEYSPACE", "market_ks")
 DNS_TIMEOUT_SECS = int(os.getenv("CASSANDRA_DNS_TIMEOUT", "60"))
 DNS_POLL_INTERVAL = float(os.getenv("CASSANDRA_DNS_INTERVAL", "1.0"))
 
-app = FastAPI(title="rtmkt-read-api", version="1.0.0")
+app = FastAPI(title="rtmkt-read-api", version="1.1.0")
 
 # ---- Cassandra (singleton)
 cluster: Cluster | None = None
@@ -31,6 +30,7 @@ session = None
 ps_ohlcv_1s: PreparedStatement | None = None
 ps_ohlcv_1m: PreparedStatement | None = None
 ps_ind_1m: PreparedStatement | None = None
+ps_sig_recent: PreparedStatement | None = None
 
 
 def _clean_contact_points(raw: str) -> List[str]:
@@ -76,6 +76,7 @@ def _ts(x) -> Optional[str]:
     return str(x)
 
 
+# ---------- Models ----------
 class OHLCV(BaseModel):
     symbol: str
     bucket_date: str
@@ -102,9 +103,22 @@ class Indicator1m(BaseModel):
     vol_1m: Optional[float] = None
 
 
+class SignalRecent(BaseModel):
+    symbol: str
+    bucket_date: str
+    ts: str
+    type: str
+    pct_change: float
+    close: Optional[float] = None
+    vwap: Optional[float] = None
+    volume: Optional[float] = None
+    src: Optional[str] = None
+
+
+# ---------- Startup / Shutdown ----------
 @app.on_event("startup")
 def on_startup():
-    global cluster, session, ps_ohlcv_1s, ps_ohlcv_1m, ps_ind_1m
+    global cluster, session, ps_ohlcv_1s, ps_ohlcv_1m, ps_ind_1m, ps_sig_recent
 
     contact_points = _clean_contact_points(RAW_CONTACTS)
     if not contact_points:
@@ -115,7 +129,7 @@ def on_startup():
 
     _wait_for_dns(contact_points, timeout_s=DNS_TIMEOUT_SECS, interval_s=DNS_POLL_INTERVAL)
 
-    # Put row_factory into the execution profile (don’t set session.row_factory directly)
+    # Use ExecutionProfile with dict_factory
     profile = ExecutionProfile(
         load_balancing_policy=RoundRobinPolicy(),
         row_factory=dict_factory,
@@ -166,6 +180,18 @@ def on_startup():
     )
     ps_ind_1m.consistency_level = ConsistencyLevel.ONE
 
+    # Signals (recent)
+    ps_sig_recent = session.prepare(
+        """
+        SELECT symbol, bucket_date, ts, type, pct_change, close, vwap, volume, src
+        FROM signals_recent
+        WHERE symbol=? AND bucket_date=?
+        ORDER BY ts DESC
+        LIMIT ?
+        """
+    )
+    ps_sig_recent.consistency_level = ConsistencyLevel.ONE
+
 
 @app.on_event("shutdown")
 def on_shutdown():
@@ -176,6 +202,7 @@ def on_shutdown():
         cluster.shutdown()
 
 
+# ---------- Health ----------
 @app.get("/healthz")
 def healthz():
     return {
@@ -186,6 +213,7 @@ def healthz():
     }
 
 
+# ---------- Helpers ----------
 def _parse_date(d: Optional[str]) -> date:
     if not d:
         return datetime.utcnow().date()
@@ -225,6 +253,21 @@ def _row_to_ind(r) -> Indicator1m:
     )
 
 
+def _row_to_signal(r) -> SignalRecent:
+    return SignalRecent(
+        symbol=r["symbol"],
+        bucket_date=str(r["bucket_date"]),
+        ts=_ts(r["ts"]),
+        type=r.get("type") or "pct_change",
+        pct_change=float(r["pct_change"]),
+        close=float(r["close"]) if r.get("close") is not None else None,
+        vwap=float(r["vwap"]) if r.get("vwap") is not None else None,
+        volume=float(r["volume"]) if r.get("volume") is not None else None,
+        src=r.get("src"),
+    )
+
+
+# ---------- Core JSON endpoints (unchanged + signals) ----------
 @app.get("/ohlcv/1s", response_model=List[OHLCV])
 def ohlcv_1s(
     symbol: str = Query(..., min_length=1),
@@ -256,3 +299,105 @@ def indicators_1m(
     bdate = _parse_date(date_str)
     rows = session.execute(ps_ind_1m, [symbol.upper(), bdate, limit])
     return [_row_to_ind(r) for r in rows]
+
+
+@app.get("/signals/recent", response_model=List[SignalRecent])
+def signals_recent(
+    symbol: str = Query(..., min_length=1),
+    date_str: Optional[str] = Query(None, alias="date"),
+    limit: int = Query(100, ge=1, le=2000),
+    type: str = Query("pct_change"),
+    min_abs: float = Query(0.0, ge=0.0),
+):
+    """
+    Read recent signals from Cassandra (written by Spark).
+    - Filters by symbol + bucket_date.
+    - Optional filter on `type` (default 'pct_change').
+    - Optional post-filter on |pct_change| >= min_abs (applied after fetch).
+    """
+    bdate = _parse_date(date_str)
+    rows = session.execute(ps_sig_recent, [symbol.upper(), bdate, limit])
+    out = []
+    for r in rows:
+        if type and r.get("type") and r["type"] != type:
+            continue
+        if min_abs and abs(r.get("pct_change") or 0.0) < min_abs:
+            continue
+        out.append(_row_to_signal(r))
+    return out
+
+
+# ---------- Grafana-friendly timeseries endpoints ----------
+# These return arrays like: [{"time":"2023-11-14T22:13:00Z","value":430.15}, ...]
+@app.get("/ts/ohlcv/1m")
+def ts_ohlcv_1m(
+    symbol: str = Query(..., min_length=1),
+    field: str = Query("close", pattern="^(open|high|low|close|vwap)$"),
+    date_str: Optional[str] = Query(None, alias="date"),
+    limit: int = Query(1000, ge=1, le=5000),
+):
+    bdate = _parse_date(date_str)
+    rows = session.execute(ps_ohlcv_1m, [symbol.upper(), bdate, limit])
+    series = []
+    for r in rows:
+        val = r.get(field)
+        if val is None:
+            continue
+        series.append({"time": _ts(r["window_start"]), "value": float(val)})
+    return series
+
+
+@app.get("/ts/ohlcv/1s")
+def ts_ohlcv_1s(
+    symbol: str = Query(..., min_length=1),
+    field: str = Query("close", pattern="^(open|high|low|close|vwap)$"),
+    date_str: Optional[str] = Query(None, alias="date"),
+    limit: int = Query(1000, ge=1, le=5000),
+):
+    bdate = _parse_date(date_str)
+    rows = session.execute(ps_ohlcv_1s, [symbol.upper(), bdate, limit])
+    series = []
+    for r in rows:
+        val = r.get(field)
+        if val is None:
+            continue
+        series.append({"time": _ts(r["window_start"]), "value": float(val)})
+    return series
+
+
+@app.get("/ts/indicators/1m")
+def ts_indicators_1m(
+    symbol: str = Query(..., min_length=1),
+    field: str = Query("vwap_1m", pattern="^(vwap_1m|vol_1m)$"),
+    date_str: Optional[str] = Query(None, alias="date"),
+    limit: int = Query(1000, ge=1, le=5000),
+):
+    bdate = _parse_date(date_str)
+    rows = session.execute(ps_ind_1m, [symbol.upper(), bdate, limit])
+    series = []
+    for r in rows:
+        val = r.get(field)
+        if val is None:
+            continue
+        series.append({"time": _ts(r["window_start"]), "value": float(val)})
+    return series
+
+
+@app.get("/ts/signals/recent")
+def ts_signals_recent(
+    symbol: str = Query(..., min_length=1),
+    date_str: Optional[str] = Query(None, alias="date"),
+    limit: int = Query(100, ge=1, le=2000),
+    type: str = Query("pct_change"),
+    min_abs: float = Query(0.0, ge=0.0),
+):
+    bdate = _parse_date(date_str)
+    rows = session.execute(ps_sig_recent, [symbol.upper(), bdate, limit])
+    series = []
+    for r in rows:
+        if type and r.get("type") and r["type"] != type:
+            continue
+        if min_abs and abs(r.get("pct_change") or 0.0) < min_abs:
+            continue
+        series.append({"time": _ts(r["ts"]), "value": float(r["pct_change"]), "type": r.get("type") or "pct_change"})
+    return series
